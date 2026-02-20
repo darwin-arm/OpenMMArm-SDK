@@ -72,9 +72,9 @@ def generate_launch_description():
         output='screen',
         parameters=[
             {'use_sim_time': use_sim_time},
-            # 可以在这里覆盖参数，例如 connection_mode
+            {'communication': 'SIM'},
+            {'sim.model_path': LaunchConfiguration('sim_model_path')},
         ],
-        # 如果 openmmarm_controller 需要配置文件，可以通过 --ros-args --params-file 加载
     )
 
     # openmmarm_hw 启动（ros2_control 硬件接口）
@@ -154,6 +154,11 @@ def generate_launch_description():
             'use_moveit',
             default_value='true',
             description='启动 MoveIt move_group',
+        ),
+        DeclareLaunchArgument(
+            'sim_model_path',
+            default_value='',
+            description='MuJoCo 模型文件路径 (留空则自动使用 openmmarm_description 中的 URDF)',
         ),
         controller_node,
         robot_state_publisher_node,

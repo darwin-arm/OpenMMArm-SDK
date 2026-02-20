@@ -1,76 +1,147 @@
-# openmmarm_sdk
+# OpenMMArm SDK
 
-OpenMMArm 的 C++ SDK，提供 `ArmCmd`/`ArmState` UDP 通信接口，用于在上位机程序中直接控制机械臂。
+## 1. 简介
+`openmmarm_sdk` 是 OpenMMArm 机械臂的底层 C++ 控制和接口开发套件。本 SDK 的主要受众是需要通过 UDP 对机械臂进行高速、低延迟以及闭环控制的开发人员。不管是在 Gazebo 仿真环境中对接 `openmmarm_controller`，还是未来对接真实的机械臂核心板，该 SDK 都提供了稳健的底层通信。
 
-## 架构简述
+---
 
-`openmmarm_sdk` 位于“应用接入层”：
+## 2. 核心架构设计
 
-- 作为 SDK 客户端连接 `openmmarm_controller` 的 `udp.sdk_port`（默认 `8871`）
-- 每个控制周期执行一次 `sendRecv()` 完成“发指令 + 收状态”
-- 不直接访问电机，最终执行由 `openmmarm_controller` 决定
+SDK 的整体架构如下图所示：
 
-## 使用方法
+```text
++-----------------------------------------------------------+
+|                      User Application                     |
+|              (ROS 2 Node / C++ Executable)                |
++-----------------------------------------------------------+
+                              |
+                     主循环: 调用 sendRecv()
+                              v
++-----------------------------------------------------------+
+|                      OpenMMArm SDK                        |
+|                                                           |
+|  +----------------+  +---------------------------------+  |
+|  |   Timer/Loop   |  | OpenMMArmSdk (主控上下文维护)   |  |
+|  | (精确节拍控制) |  +---------------------------------+  |
+|  +----------------+             | 数据交互                |
+|                                 v                         |
+|                      +---------------------------------+  |
+|                      |  ArmCmd (指令) & ArmState(反馈) |  |
+|                      | (使用 Eigen3 映射实现零拷贝)    |  |
+|                      +---------------------------------+  |
+|                                 | 序列化打包              |
+|                                 v                         |
+|                      +---------------------------------+  |
+|                      |     UdpPort (底层通信封装)      |  |
+|                      | (内置 CRC32 丢包与错乱校验)     |  |
+|                      +---------------------------------+  |
++-----------------------------------------------------------+
+                              | UDP 数据包流
+                              v
++-----------------------------------------------------------+
+|                  Hardware / Simulation                    |
+|       (openmmarm_controller / 物理机械臂真实硬件)         |
++-----------------------------------------------------------+
+```
 
-### 1. 编译
+SDK 以模块化的思想组织代码，分为以下几个核心功能区域：
 
+### 2.1 主控抽象层 (`openmmarm_arm.h`)
+`OpenMMArmSdk` 是最上层类，封装并维护了控制循环的上下文。
+主要职责包括：
+- **自动握手与校验 (`init()`)**: 初始化时，会发送携带客户端约定版本号的 `INVALID` 指令探测控制器。成功握手后，自动通过返回的信息匹配主板版本是否兼容，并将机械臂的初始状态拉取到 `armCmd.q_d`，完成真正的对齐。
+- **发送收发管线 (`sendRecv()`)**: 在每一个硬实时控制节拍（默认 250Hz）中，**负责执行最核心的、一次性的“下发-听取”闭环**。
+  - 函数前半段：将包含最新期望的 `ArmCmd` 对象直接序列化，打入网卡发送给下位机。
+  - 函数后半段：自动短暂阻塞挂起当前线程，监听回传端口，在极短时间内收取下位机传回的最热乎的本体遥测数据解包至 `ArmState` 内，保证下一次基于最新物理状态进行控制迭代。（*注意：没有任何通信，就没有实时控制，大循环必备此句*）
+- **状态及异常监测 (`printLog()`)**: 自动提取包中的限制（位置越界、速度越界等），并在本地触发报警或提供异常重置支持。
+
+### 2.2 通信协议层 (`openmmarm_arm_common.h` 与 `udp_port.h`)
+- **数据结构与反射接口 (`ArmCmd` 与 `ArmState`)**: 使用了 `#pragma pack(push, 1)` 对通信实体进行了单字节紧凑对齐以保证跨平台网络传输。`ArmCmd` 就像一张你需要填写的“指令表格”，它包括：
+  - `mode` (控制模式开关): `PASSIVE` (阻尼松软) / `JOINT_CTRL` (轨迹追踪) / `LOW_CMD` (底层透传)。
+  - `q_d`, `dq_d` (针对 6 个轴的期望位姿转动与期望角速度)。
+  - `Kp`, `Kd` (阻抗刚度设定，调大会更硬、死守轨迹；调小会变软，实现柔顺力控)。
+  - `tau_d` (前馈力矩，用于绕过 PID 计算，强制输出特定牛米扭矩，如重力补偿或 RL 神经网络输出点)。
+- **Eigen3 零拷贝映射**: 虽然底层传输是 `std::array<double, 6>`，但结构体内部提供了诸如 `armCmd.getQ()` / `armCmd.setQ(Vec6)` 的 `Eigen::Map` 方法。使得用户可以进行高速的雅可比行列式计算及其他高级运动学代数解算。
+- **UdpPort 套接字封装**: 封装了源生的 `<arpa/inet.h>` C API。支持配置超时时长实现非阻塞收发。内置了基于 `uint32_t` 的 `CRC32` 帧尾校验器算法，每次 `send` 会在结尾注入根据本体计算的 CRC 签名，每次 `recv` 则会比对以确保信道不丢帧、不错乱。
+
+### 2.3 节拍器模块 (`timer.h`)
+用于实现硬实时和确定性的软件控制回路频率。
+- **自适应 Timer**: 用户可以使用类似 `Timer timer(0.004);` 进行控制。调用 `sleep()` 时类会内部通过 `std::chrono::steady_clock` 判断当前事务究竟消耗了多少微秒，然后只在剩余的时钟窗口挂起线程。
+- **异步循环 Loop (可选)**: 若开发者不想写裸露的 `while(true)`，可以将逻辑注册进入 `Loop` 对象，内部将自创建一个 `std::thread` 依照所设参数精确地执行闭包，并支持检测“超时率（计算超过给定时长的百分比）”。
+
+---
+
+## 3. 数据流程与控制律解析
+
+为了更加直观地展示一次控制周期的生命历程，以下提供运作时序图：
+
+```text
+ [用户应用层]            [OpenMMArmSdk]             [UDP 通信层]             [机械臂控制器]
+      |                        |                        |                        |
+      |--- init() 启动对齐 --->|                        |                        |
+      |                        |--- 发送 INVALID 指令-->|                        |
+      |                        |                        |---- UDP 探测数据包 --->|
+      |                        |                        |<--- 物理版本和初始状态-|
+      |<-- 提取位姿并同步 q_d -|                        |                        |
+      |                        |                        |                        |
+      |============================ 硬实时控制大循环 (例如 250Hz / 4ms) ============================|
+      |                        |                        |                        |
+      |-- 赋值更新 armCmd ---->|                        |                        |
+      |-- 调用 sendRecv() ---->|                        |                        |
+      |                        |--- 封包下放指令 ------>|                        |
+      |                        |                        |---- 下放指令+CRC32 --->|
+      |                        |                        |                        |  * 执行最核心控制闭环:
+      |                        |                        |                        |  * tau = Kp*(q_d - q) + Kd*(dq_d - dq) + tau_d
+      |                        |                        |<-- 上抛新编码器数据 ---|
+      |                        |<--- CRC校验并更新实体--|                        |
+      |<-- 控制周期执行完毕 ---|                        |                        |
+      |-- Timer.sleep() 补齐---|                        |                        |
+      |                        |                        |                        |
+```
+
+无论处在什么模式，SDK 对电机的控制公式最终可以收束在：
+> `tau = Kp * (q_d - q) + Kd * (dq_d - dq) + tau_d`
+
+- `q`，`dq`: 真实时刻回读传感器位置和速度（ArmState 提取）。
+- `q_d`，`dq_d`，`tau_d`: 等待发送的期望位置、速度及前馈控制力矩（ArmCmd 设置）。
+- `Kp`，`Kd`: 位置与速度 PD 调节比例系数。
+
+### **模式调度机制**
+- **被动状态 (PASSIVE)**: 上层代码虽然仍会进行 `sendRecv()` 维持在线状态，但驱动层强制阻断目标设定并锁死输出电流与力矩，使机械臂表现为零阻尼松软状态。
+- **关节控制 (JOINT_CTRL)**: 驱动板将启用由设备配置指定的默认 `Kp/Kd` 组。通过不断给予新的位置 `q_d` 实现轨迹跟随。
+- **透传控制 (LOW_CMD)**: 高阶模式。在此模式下上层可注入完全自定义的增益数组以及所有参数项（可参考强化学习网络吐出的动作或力控算出的 tau），完全释放给用户的外部解算器（如 MuJoCo 环境中的解）。
+
+---
+
+## 4. 依赖项与编译
+依赖 `ament_cmake` 及 `Eigen3` 库。
 ```bash
-colcon build --packages-select openmmarm_sdk --symlink-install
+cd ~/Code/OpenMMArm-SDK
+colcon build --packages-select openmmarm_sdk
 source install/setup.bash
 ```
 
-### 2. 先启动控制器
+## 5. 示例程序解析
+生成的可执行二进制文件位于 `install/openmmarm_sdk/lib/openmmarm_sdk/` 目录下。运行前确保服务端（如 `sim_arm.launch.py`）已启动。
 
-仿真场景推荐：
-
-```bash
-ros2 launch openmmarm_bringup sim_arm.launch.py
-```
-
-### 3. 运行示例
-
-```bash
-./install/openmmarm_sdk/lib/openmmarm_sdk/example_joint_ctrl
-./install/openmmarm_sdk/lib/openmmarm_sdk/example_lowcmd
-```
-
-可指定控制器 IP：
+### 5.1 example_joint_ctrl.cpp
+演示基础使用流程，控制系统会在 `q_d` 和 `dq_d` 上下功夫：
+1. `init()` 握手建立连接并读取当期位置。
+2. 配置 `ArmMode::JOINT_CTRL`。
+3. 第一阶段：目标速度给定为 `0.3` rad/s，并在内层循环中更新命令，利用 `timer.sleep()` 稳定节拍为 4ms。
+4. 第二阶段：位置跟随，逐渐修改 `q(0)` 并同时设置 `setQ` 到命令数据包，以实现回移操作。
 
 ```bash
-./install/openmmarm_sdk/lib/openmmarm_sdk/example_joint_ctrl 192.168.123.110
+ros2 run openmmarm_sdk example_joint_ctrl 127.0.0.1
 ```
 
-### 4. 最小调用流程
+### 5.2 example_lowcmd.cpp
+该案例更关注对于基础 PD 和扭矩的掌控：
+1. 初始化并检查当前是否处在 `PASSIVE`。该检查是进入物理透传时的必要保护锁，防止进入的一瞬间由于位置突变导致过冲。
+2. 手动构建各关节阻抗，填充 `Kp` 和 `Kd` 表。
+3. 从 `armState.q` 拉取同相数据放入 `armCmd.q_d` 抹平误差，随后再执行模式切换至 `LOW_CMD`。
+4. 随后再在循环中进行目标偏置 `q_d[0] += ...` 来下发行程动作。
 
-```cpp
-#include "openmmarm_sdk/openmmarm_arm.h"
-
-int main() {
-  OPENMMARM_SDK::OpenMMArmSdk arm("127.0.0.1");
-  arm.init();
-
-  OPENMMARM_SDK::Timer timer(arm.dt);
-  while (true) {
-    arm.armCmd.mode = static_cast<uint8_t>(OPENMMARM_SDK::ArmMode::JOINT_CTRL);
-    arm.armCmd.q_d[0] = 1.0;
-    arm.sendRecv();
-    timer.sleep();
-  }
-}
+```bash
+ros2 run openmmarm_sdk example_lowcmd 127.0.0.1
 ```
-
-## 常用字段
-
-### `ArmCmd`
-
-- `mode`：目标模式（`PASSIVE` / `JOINT_CTRL` / `LOW_CMD` 等）
-- `q_d[6]`：目标关节角
-- `dq_d[6]`：目标关节速度
-- `tau_d[6]`：前馈力矩
-- `Kp[6]`、`Kd[6]`：增益（用于需要自定义增益的场景）
-
-### `ArmState`
-
-- `mode`：当前模式
-- `q[6]`、`dq[6]`、`tau[6]`：反馈状态
-- `errors[8]`：错误标志

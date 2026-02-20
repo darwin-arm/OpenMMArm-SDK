@@ -18,7 +18,7 @@
 #include "fsm/FiniteStateMachine.h"
 #include "fsm/State_JointCtrl.h"
 #include "fsm/State_Passive.h"
-#include "io/IOROS.h"
+#include "io/IOMujoco.h"
 #include "io/IOUDP.h"
 
 // 全局运行标志
@@ -35,11 +35,12 @@ class OpenMMArmControllerNode : public rclcpp::Node {
 public:
   OpenMMArmControllerNode() : Node("openmmarm_controller") {
     // 声明参数
-    this->declare_parameter<std::string>("communication", "ROS");
+    this->declare_parameter<std::string>("communication", "SIM");
     this->declare_parameter<std::string>("udp.mcu_ip", "192.168.123.110");
     this->declare_parameter<int>("udp.mcu_port", 8881);
     this->declare_parameter<int>("udp.local_port", 8871);
     this->declare_parameter<int>("udp.sdk_port", 8871);
+    this->declare_parameter<std::string>("sim.model_path", "");
     this->declare_parameter<bool>("collision.open", true);
     this->declare_parameter<double>("collision.limit_torque", 10.0);
 
@@ -87,13 +88,43 @@ public:
           std::make_shared<IOUDP>(mcu_ip, mcu_port, local_port);
       RCLCPP_INFO(this->get_logger(), "使用 UDP 通信模式 [%s:%d]",
                   mcu_ip.c_str(), mcu_port);
-    } else if (communication == "ROS") {
-      ctrlComp_->ioInter = std::make_shared<IOROS>(shared_from_this());
-      RCLCPP_INFO(this->get_logger(), "使用 ROS 2 Topics 通信模式");
+    } else if (communication == "SIM") {
+      std::string model_path =
+          this->get_parameter("sim.model_path").as_string();
+      if (model_path.empty()) {
+        // 默认使用 openmmarm_description 包中的 URDF
+        try {
+          std::string desc_path = ament_index_cpp::get_package_share_directory(
+              "openmmarm_description");
+          model_path = desc_path + "/urdf/openmmarm.urdf";
+        } catch (const std::exception &e) {
+          RCLCPP_ERROR(this->get_logger(), "无法自动定位模型文件: %s",
+                       e.what());
+          return false;
+        }
+      }
+      ctrlComp_->ioInter =
+          std::make_shared<IOMujoco>(model_path, ctrlComp_->dt);
+      RCLCPP_INFO(this->get_logger(), "使用 MuJoCo 仿真模式，模型: %s",
+                  model_path.c_str());
     } else {
-      RCLCPP_WARN(this->get_logger(), "未知通信模式: %s，使用默认 ROS 模式",
+      RCLCPP_WARN(this->get_logger(), "未知通信模式: %s，使用默认 SIM 模式",
                   communication.c_str());
-      ctrlComp_->ioInter = std::make_shared<IOROS>(shared_from_this());
+      std::string model_path =
+          this->get_parameter("sim.model_path").as_string();
+      if (model_path.empty()) {
+        try {
+          std::string desc_path = ament_index_cpp::get_package_share_directory(
+              "openmmarm_description");
+          model_path = desc_path + "/urdf/openmmarm.urdf";
+        } catch (const std::exception &e) {
+          RCLCPP_ERROR(this->get_logger(), "无法自动定位模型文件: %s",
+                       e.what());
+          return false;
+        }
+      }
+      ctrlComp_->ioInter =
+          std::make_shared<IOMujoco>(model_path, ctrlComp_->dt);
     }
 
     RCLCPP_INFO(this->get_logger(), "等待与机械臂建立连接...");
@@ -155,43 +186,22 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  // ========== 三线程架构 ==========
+  // ========== 双线程架构 ==========
   // 线程 1: Main Thread (当前线程) - 保活和生命周期管理
   // 线程 2: Control Loop Thread - 在 FSM::start() 中已启动
-  // 线程 3: ROS Executor Thread - 在下面启动
+  // (MuJoCo 模式下不需要 ROS Executor 线程处理回调)
 
-  // 创建独立的 ROS Executor 线程用于处理回调
-  std::atomic<bool> executor_running{true};
-  std::thread executor_thread([&node, &executor_running]() {
-    rclcpp::executors::SingleThreadedExecutor executor;
-    executor.add_node(node);
-
-    RCLCPP_INFO(node->get_logger(), "[线程 3] ROS Executor 线程已启动");
-
-    while (executor_running && rclcpp::ok()) {
-      // 高频处理 ROS 回调 (1kHz)
-      executor.spin_some(std::chrono::milliseconds(1));
-    }
-
-    RCLCPP_INFO(node->get_logger(), "[线程 3] ROS Executor 线程已退出");
-  });
-
-  RCLCPP_INFO(node->get_logger(),
-              "三线程架构已启动: Main(1Hz) + Control(%dHz) + ROS Executor",
+  RCLCPP_INFO(node->get_logger(), "双线程架构已启动: Main(1Hz) + Control(%dHz)",
               static_cast<int>(1.0 / 0.004));
 
   // 主循环 (1Hz 保活)
   rclcpp::Rate rate(1);
   while (rclcpp::ok() && g_running) {
-    // 主线程只负责保活，不处理 spin
+    // 主线程只负责保活
     rate.sleep();
   }
 
   // 清理
-  executor_running = false;
-  if (executor_thread.joinable()) {
-    executor_thread.join();
-  }
 
   node->shutdown();
   rclcpp::shutdown();

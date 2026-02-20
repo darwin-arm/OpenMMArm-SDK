@@ -5,7 +5,7 @@
 /**
  * @brief 硬件抽象接口基类
  *
- * 用于统一真机 (UDP) 和仿真 (ROS 2 Topics) 的通信接口。
+ * 用于统一真机 (UDP) 和仿真 (MuJoCo) 的通信接口。
  */
 class IOInterface {
 public:
