@@ -1,5 +1,6 @@
 #include "io/IOMujoco.h"
 #include <ament_index_cpp/get_package_share_directory.hpp>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -7,7 +8,6 @@
 #include <regex>
 #include <set>
 #include <sstream>
-#include <chrono>
 
 #ifdef OPENMMARM_HAS_GLFW
 #include <GLFW/glfw3.h>
@@ -133,9 +133,9 @@ static std::string simplifyMeshFilenames(const std::string &xml_content) {
 }
 
 IOMujoco::IOMujoco(const std::string &model_path, double timestep,
-                   bool enable_viewer)
+                   bool enable_viewer, const std::string &control_mode)
     : model_path_(model_path), timestep_(timestep),
-      enable_viewer_(enable_viewer) {}
+      enable_viewer_(enable_viewer), control_mode_(control_mode) {}
 
 IOMujoco::~IOMujoco() {
   closeViewer();
@@ -213,24 +213,120 @@ bool IOMujoco::init() {
   std::cout << "[IOMujoco] 已生成预处理模型: " << resolved_model_path_
             << std::endl;
 
-  // 使用预处理后的文件加载 MuJoCo 模型
+  // === 两步加载策略 ===
+  // MuJoCo 的 URDF parser 不识别 <mujoco> 扩展标签，因此无法在 URDF 中定义
+  // actuator。 策略：先以 URDF 加载 → 导出为原生 MJCF → 在 MJCF 中注入
+  // <actuator> → 重新加载。
+
+  // 第一步：以 URDF 格式加载模型（此时 nu=0）
   char error[1000] = "";
-  model_ =
+  mjModel *urdf_model =
       mj_loadXML(resolved_model_path_.c_str(), nullptr, error, sizeof(error));
 
-  if (!model_) {
-    std::cerr << "[IOMujoco] 模型加载失败: " << error << std::endl;
+  if (!urdf_model) {
+    std::cerr << "[IOMujoco] URDF 模型加载失败: " << error << std::endl;
     return false;
+  }
+
+  // 第二步：检查是否需要注入 actuator
+  if (urdf_model->nu == 0) {
+    std::cout
+        << "[IOMujoco] URDF 模型中 nu=0，正在通过 MJCF 中间格式注入 actuator..."
+        << std::endl;
+
+    // 导出为原生 MJCF 格式
+    std::string mjcf_path =
+        (model_dir / (model_fs_path.stem().string() + "_mjcf.xml")).string();
+
+    if (!mj_saveLastXML(mjcf_path.c_str(), urdf_model, error, sizeof(error))) {
+      std::cerr << "[IOMujoco] 导出 MJCF 失败: " << error << std::endl;
+      mj_deleteModel(urdf_model);
+      return false;
+    }
+
+    // 读取导出的 MJCF
+    std::ifstream mjcf_ifs(mjcf_path);
+    if (!mjcf_ifs.is_open()) {
+      std::cerr << "[IOMujoco] 无法打开导出的 MJCF: " << mjcf_path << std::endl;
+      mj_deleteModel(urdf_model);
+      return false;
+    }
+    std::stringstream mjcf_ss;
+    mjcf_ss << mjcf_ifs.rdbuf();
+    mjcf_ifs.close();
+    std::string mjcf_content = mjcf_ss.str();
+
+    // 在 MJCF 中注入 <actuator> 段（在 </mujoco> 前插入）
+    // 收集所有 joint 名称
+    std::vector<std::string> joint_names;
+    for (int i = 0; i < urdf_model->njnt; ++i) {
+      std::string jname(mj_id2name(urdf_model, mjOBJ_JOINT, i));
+      // 跳过 fixed joint（MuJoCo 内部可能不会导出 fixed joint，但安全起见检查）
+      if (urdf_model->jnt_type[i] != mjJNT_FREE) {
+        joint_names.push_back(jname);
+      }
+    }
+
+    if (!joint_names.empty()) {
+      std::stringstream actuator_block;
+      actuator_block << "\n  <actuator>\n";
+      for (const auto &jname : joint_names) {
+        if (control_mode_ == "position") {
+          // PID 模式：使用 MuJoCo 内建 position actuator
+          // PD 控制在隐式积分器内完成，适合简单场景
+          actuator_block << "    <position name=\"pos_" << jname
+                         << "\" joint=\"" << jname << "\" kp=\"100\" kv=\"10\""
+                         << " ctrllimited=\"true\" ctrlrange=\"-6.28 6.28\""
+                         << " forcelimited=\"true\" forcerange=\"-50 50\"/>\n";
+        } else {
+          // Impedance 模式：使用 motor actuator，显式写入力矩控制量
+          // 限幅保护防止极端情况
+          actuator_block << "    <motor name=\"motor_" << jname << "\" joint=\""
+                         << jname << "\" gear=\"1\""
+                         << " ctrllimited=\"true\" ctrlrange=\"-10 10\"/>\n";
+        }
+      }
+      actuator_block << "  </actuator>\n";
+
+      // 在 </mujoco> 前插入
+      size_t pos = mjcf_content.rfind("</mujoco>");
+      if (pos != std::string::npos) {
+        mjcf_content.insert(pos, actuator_block.str());
+      }
+    }
+
+    // 写回修改后的 MJCF
+    std::ofstream mjcf_ofs(mjcf_path);
+    mjcf_ofs << mjcf_content;
+    mjcf_ofs.close();
+
+    // 释放旧的 URDF 模型
+    mj_deleteModel(urdf_model);
+    urdf_model = nullptr;
+
+    // 第三步：以修改后的 MJCF 重新加载
+    model_ = mj_loadXML(mjcf_path.c_str(), nullptr, error, sizeof(error));
+    if (!model_) {
+      std::cerr << "[IOMujoco] MJCF 模型加载失败: " << error << std::endl;
+      return false;
+    }
+
+    std::cout << "[IOMujoco] 已通过 MJCF 中间格式成功注入 "
+              << joint_names.size() << " 个 actuator" << std::endl;
+  } else {
+    // 模型自带 actuator，直接使用
+    model_ = urdf_model;
   }
 
   // 设置仿真时间步长
   model_->opt.timestep = timestep_;
 
-  // 检查 actuator 定义
-  if (model_->nu == 0) {
-    std::cerr << "[IOMujoco] 警告: 模型中没有定义 actuator，"
-              << "将使用 qfrc_applied 直接施加力矩" << std::endl;
-  }
+  // 使用 implicitfast 积分器
+  // MuJoCo 官方要求：position/velocity actuator 必须搭配 implicit 或
+  // implicitfast 积分器使用，否则 Euler 积分器会将 PD 反馈力矩当作显式力处理，
+  // 导致数值振荡（抖动）。implicitfast 对 actuator 的刚度/阻尼项做隐式积分，
+  // 在保持计算效率的同时确保数值稳定性。
+  model_->opt.integrator = mjINT_IMPLICITFAST;
 
   // 创建仿真数据
   data_ = mj_makeData(model_);
@@ -246,8 +342,9 @@ bool IOMujoco::init() {
   initialized_ = true;
 
   if (enable_viewer_ && !initViewer()) {
-    std::cerr << "[IOMujoco] 警告: MuJoCo 可视化窗口初始化失败，将继续无窗口运行"
-              << std::endl;
+    std::cerr
+        << "[IOMujoco] 警告: MuJoCo 可视化窗口初始化失败，将继续无窗口运行"
+        << std::endl;
   }
 
   std::cout << "[IOMujoco] 初始化完成 - 模型: " << model_path_ << std::endl;
@@ -270,18 +367,58 @@ bool IOMujoco::sendRecv(const LowLevelCmd *cmd, LowLevelState *state) {
   // 确定实际可控制的关节数
   int n = std::min(NUM_JOINTS, model_->nv);
 
+  // 检查是否收到有效控制指令（任一关节 kp > 0 表示有主动控制）
+  if (!sim_started_) {
+    for (int i = 0; i < n; ++i) {
+      if (cmd->kp[i] > 0.0f) {
+        sim_started_ = true;
+        std::cout << "[IOMujoco] 收到有效控制指令，仿真开始推进" << std::endl;
+        break;
+      }
+    }
+  }
+
+  // 组件尚未就绪时只返回当前状态，不推进仿真
+  if (!sim_started_) {
+    for (int i = 0; i < n; ++i) {
+      state->mode[i] = cmd->mode[i];
+      state->q[i] = static_cast<float>(data_->qpos[i]);
+      state->dq[i] = static_cast<float>(data_->qvel[i]);
+      state->ddq[i] = 0.0f;
+      state->tau_est[i] = 0.0f;
+      state->temperature[i] = 25;
+    }
+    return true;
+  }
+
   // 将控制指令写入 MuJoCo
   if (model_->nu >= n) {
-    // 模型定义了足够的 actuator，使用 ctrl 数组
-    for (int i = 0; i < n; ++i) {
-      // PD 控制: tau = kp * (q_des - q) + kd * (dq_des - dq) + tau_ff
-      double q_err = static_cast<double>(cmd->q[i]) - data_->qpos[i];
-      double dq_err = static_cast<double>(cmd->dq[i]) - data_->qvel[i];
-      data_->ctrl[i] = cmd->kp[i] * q_err + cmd->kd[i] * dq_err +
-                       static_cast<double>(cmd->tau[i]);
+    if (control_mode_ == "position") {
+      // ===== Position 模式 =====
+      // 使用 position actuator：ctrl 数组存放目标角度
+      // PD 控制由 MuJoCo 隐式积分器在内部完成，数值稳定
+      for (int i = 0; i < n; ++i) {
+        data_->ctrl[i] = static_cast<double>(cmd->q[i]);
+      }
+    } else {
+      // ===== Impedance 模式 (关节阻抗力矩控制) =====
+      // 显式控制律：
+      //   tau = h(q,dq) + Kp*(q_d-q) + Kd*(dq_d-dq) + tau_d
+      // 其中 h(q,dq)=qfrc_bias。
+      //
+      // 对应标准关节阻抗形式（定义 e_tilde = q-q_d）：
+      //   M(q)*e_tilde_ddot + Kd*e_tilde_dot + Kp*e_tilde = tau_ext + tau_d
+      // （在参考加速度近似为 0 时成立）。
+      for (int i = 0; i < n; ++i) {
+        double q_err = static_cast<double>(cmd->q[i]) - data_->qpos[i];
+        double dq_err = static_cast<double>(cmd->dq[i]) - data_->qvel[i];
+        double tau_pd = cmd->kp[i] * q_err + cmd->kd[i] * dq_err;
+        double tau_ff = static_cast<double>(cmd->tau[i]);
+        data_->ctrl[i] = data_->qfrc_bias[i] + tau_pd + tau_ff;
+      }
     }
   } else {
-    // 没有 actuator，直接施加关节力矩
+    // 没有 actuator，直接施加关节力矩（后备方案）
     for (int i = 0; i < n; ++i) {
       double q_err = static_cast<double>(cmd->q[i]) - data_->qpos[i];
       double dq_err = static_cast<double>(cmd->dq[i]) - data_->qvel[i];
@@ -368,8 +505,8 @@ void IOMujoco::viewerLoop() {
     return;
   }
 
-  window_ = glfwCreateWindow(1280, 800, "OpenMMArm MuJoCo Viewer", nullptr,
-                             nullptr);
+  window_ =
+      glfwCreateWindow(1280, 800, "OpenMMArm MuJoCo Viewer", nullptr, nullptr);
   if (!window_) {
     std::cerr << "[IOMujoco] 无法创建 MuJoCo 可视化窗口" << std::endl;
     glfwTerminate();
@@ -380,6 +517,12 @@ void IOMujoco::viewerLoop() {
   glfwMakeContextCurrent(window_);
   // 开启垂直同步，渲染线程自行节流，不阻塞控制线程。
   glfwSwapInterval(1);
+
+  // 注册鼠标交互回调（左键旋转、右键平移、滚轮缩放）
+  glfwSetWindowUserPointer(window_, this);
+  glfwSetMouseButtonCallback(window_, &IOMujoco::mouseButtonCallback);
+  glfwSetCursorPosCallback(window_, &IOMujoco::cursorPosCallback);
+  glfwSetScrollCallback(window_, &IOMujoco::scrollCallback);
 
   mjv_defaultCamera(&camera_);
   mjv_defaultOption(&option_);
@@ -433,6 +576,71 @@ void IOMujoco::viewerLoop() {
 #else
   (void)this;
 #endif
+}
+
+// ===== GLFW 鼠标交互回调实现 =====
+
+void IOMujoco::mouseButtonCallback(GLFWwindow *w, int button, int action,
+                                   int /*mods*/) {
+  auto *self = static_cast<IOMujoco *>(glfwGetWindowUserPointer(w));
+  if (!self)
+    return;
+
+  bool pressed = (action == GLFW_PRESS);
+  if (button == GLFW_MOUSE_BUTTON_LEFT)
+    self->mouse_button_left_ = pressed;
+  if (button == GLFW_MOUSE_BUTTON_MIDDLE)
+    self->mouse_button_middle_ = pressed;
+  if (button == GLFW_MOUSE_BUTTON_RIGHT)
+    self->mouse_button_right_ = pressed;
+
+  // 记录按下时的光标位置
+  glfwGetCursorPos(w, &self->mouse_last_x_, &self->mouse_last_y_);
+}
+
+void IOMujoco::cursorPosCallback(GLFWwindow *w, double xpos, double ypos) {
+  auto *self = static_cast<IOMujoco *>(glfwGetWindowUserPointer(w));
+  if (!self)
+    return;
+
+  // 没有按键按下时忽略
+  if (!self->mouse_button_left_ && !self->mouse_button_middle_ &&
+      !self->mouse_button_right_) {
+    self->mouse_last_x_ = xpos;
+    self->mouse_last_y_ = ypos;
+    return;
+  }
+
+  double dx = xpos - self->mouse_last_x_;
+  double dy = ypos - self->mouse_last_y_;
+  self->mouse_last_x_ = xpos;
+  self->mouse_last_y_ = ypos;
+
+  int width, height;
+  glfwGetWindowSize(w, &width, &height);
+
+  // 确定 MuJoCo 动作类型
+  mjtMouse action = mjMOUSE_NONE;
+  if (self->mouse_button_left_)
+    action = mjMOUSE_ROTATE_V;
+  else if (self->mouse_button_middle_)
+    action = mjMOUSE_MOVE_V;
+  else if (self->mouse_button_right_)
+    action = mjMOUSE_ZOOM;
+
+  mjv_moveCamera(self->model_, action, dx / width, dy / height, &self->scene_,
+                 &self->camera_);
+}
+
+void IOMujoco::scrollCallback(GLFWwindow *w, double /*xoffset*/,
+                              double yoffset) {
+  auto *self = static_cast<IOMujoco *>(glfwGetWindowUserPointer(w));
+  if (!self)
+    return;
+
+  // 滚轮缩放
+  mjv_moveCamera(self->model_, mjMOUSE_ZOOM, 0.0, -0.05 * yoffset,
+                 &self->scene_, &self->camera_);
 }
 
 void IOMujoco::closeViewer() {

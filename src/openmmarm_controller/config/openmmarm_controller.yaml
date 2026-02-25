@@ -1,7 +1,7 @@
 # OpenMMARM 机械臂控制器参数配置
 
-# 通信模式: ROS (仿真) 或 UDP (真机)
-communication: "ROS"
+# 通信模式: SIM (仿真) 或 UDP (真机)
+communication: "SIM"
 
 # UDP 通信配置 (真机模式)
 udp:
@@ -17,6 +17,8 @@ collision:
 # 控制参数
 control:
   dt: 0.004  # 控制周期 (250Hz)
+  # 控制模式: "position" (PID 隐式积分) 或 "impedance" (关节阻抗力矩控制)
+  mode: "position"
   
 # 关节 PD 参数 (默认值)
 joint_pd:

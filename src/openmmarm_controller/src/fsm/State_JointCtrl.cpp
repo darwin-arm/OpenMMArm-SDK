@@ -6,11 +6,34 @@ State_JointCtrl::State_JointCtrl(std::shared_ptr<CtrlComponents> ctrlComp)
 
 void State_JointCtrl::enter() {
   // 进入关节控制模式
-  // 初始化 PD 参数
+  // 以当前位置为初始目标，防止切换瞬间的力矩突跳
+
+  // 根据控制模式设定不同的 PD 增益
+  float default_kp, default_kd;
+  if (ctrlComp_->controlMode == "impedance") {
+    // 阻抗模式：默认关节刚度/阻尼（可被 SDK 动态覆盖）
+    default_kp = 25.0f;
+    default_kd = 10.0f;
+  } else {
+    // Position 模式：增益由 MuJoCo 内建隐式积分器使用
+    // 此处 kp/kd 不参与物理计算，仅作占位
+    default_kp = 20.0f;
+    default_kd = 5.0f;
+  }
+
   for (int i = 0; i < 6; ++i) {
-    ctrlComp_->lowCmd->mode[i] = 10;   // 位置控制模式
-    ctrlComp_->lowCmd->kp[i] = 100.0f; // 默认刚度
-    ctrlComp_->lowCmd->kd[i] = 5.0f;   // 默认阻尼
+    ctrlComp_->lowCmd->mode[i] = 10; // 位置控制模式
+    ctrlComp_->lowCmd->kp[i] = default_kp;
+    ctrlComp_->lowCmd->kd[i] = default_kd;
+    ctrlComp_->lowCmd->q[i] = ctrlComp_->lowState->q[i];
+    ctrlComp_->lowCmd->dq[i] = 0.0f;
+    ctrlComp_->lowCmd->tau[i] = 0.0f;
+  }
+  // 同步更新 fsmArmCmd，使 setJointCmd() 在收到 SDK 指令前保持当前位置
+  for (int i = 0; i < 6; ++i) {
+    ctrlComp_->fsmArmCmd->q(i) = ctrlComp_->lowState->q[i];
+    ctrlComp_->fsmArmCmd->dq(i) = 0.0;
+    ctrlComp_->fsmArmCmd->tau(i) = 0.0;
   }
 }
 

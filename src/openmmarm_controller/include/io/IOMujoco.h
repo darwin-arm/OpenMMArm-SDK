@@ -32,9 +32,13 @@ public:
    * @brief 构造函数
    * @param model_path URDF 或 MJCF 模型文件的绝对路径
    * @param timestep 仿真时间步长 (秒)，默认 0.004 对应 250Hz
+   * @param enable_viewer 是否启用 MuJoCo 可视化窗口
+   * @param control_mode 控制模式: "position" (隐式 PD) 或 "impedance"
+   * (关节阻抗力矩控制)
    */
   explicit IOMujoco(const std::string &model_path, double timestep = 0.004,
-                    bool enable_viewer = false);
+                    bool enable_viewer = false,
+                    const std::string &control_mode = "impedance");
   ~IOMujoco() override;
 
   bool init() override;
@@ -46,10 +50,18 @@ private:
   void viewerLoop();
   void closeViewer();
 
+  // GLFW 鼠标交互回调（静态函数，通过 userPointer 访问实例）
+  static void mouseButtonCallback(GLFWwindow *w, int button, int action,
+                                  int mods);
+  static void cursorPosCallback(GLFWwindow *w, double xpos, double ypos);
+  static void scrollCallback(GLFWwindow *w, double xoffset, double yoffset);
+
   std::string model_path_;          // 原始模型文件路径
   std::string resolved_model_path_; // 预处理后的临时模型文件路径
   double timestep_;
   bool enable_viewer_ = false;
+  std::string control_mode_ =
+      "impedance"; // "position" 或 "impedance"(关节阻抗)
   std::atomic<bool> viewer_initialized_{false};
   std::atomic<bool> viewer_stop_requested_{false};
   std::thread viewer_thread_;
@@ -70,8 +82,18 @@ private:
 
   bool is_connected_ = false;
 
+  // 仿真是否已开始推进（收到首个有效控制指令后置 true）
+  bool sim_started_ = false;
+
   // init() 期间创建的符号链接，析构时清理
   std::vector<std::filesystem::path> created_symlinks_;
+
+  // 鼠标交互状态
+  bool mouse_button_left_ = false;
+  bool mouse_button_middle_ = false;
+  bool mouse_button_right_ = false;
+  double mouse_last_x_ = 0.0;
+  double mouse_last_y_ = 0.0;
 
   // 关节数量
   static constexpr int NUM_JOINTS = 6;

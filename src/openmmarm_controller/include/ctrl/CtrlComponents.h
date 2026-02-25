@@ -87,4 +87,24 @@ struct CtrlComponents {
   // 碰撞检测
   bool collisionOpen = true;
   double collisionLimitT = 10.0;
+
+  // 底层控制模式: "position" (PID 隐式积分) 或 "impedance" (关节阻抗力矩控制)
+  std::string controlMode = "impedance";
+
+  // 通信模式: "SIM" 或 "UDP"
+  std::string communicationMode = "SIM";
+
+  // UDP 配置
+  struct UdpConfig {
+    std::string mcu_ip = "192.168.123.110";
+    int mcu_port = 8881;
+    int local_port = 8871;
+    int sdk_port = 8871;
+  } udp;
+
+  // 仿真配置
+  struct SimConfig {
+    std::string model_path = "";
+    bool viewer = true;
+  } sim;
 };

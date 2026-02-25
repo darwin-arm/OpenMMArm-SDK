@@ -4,6 +4,9 @@
 #include <fcntl.h>
 #include <iostream>
 
+// 诊断计数器
+static int diag_frame_count = 0;
+
 UdpSdk::UdpSdk(int port, std::shared_ptr<LowLevelState> lowState)
     : port_(port), lowState_(lowState) {
   std::memset(&client_addr_, 0, sizeof(client_addr_));
@@ -69,10 +72,9 @@ void UdpSdk::sendRecv() {
   if (recvLen == static_cast<ssize_t>(sizeof(OPENMMARM_SDK::ArmCmd))) {
     // CRC32 校验
     uint32_t receivedCrc = recvBuf.crc;
-    recvBuf.crc = 0;
-    uint32_t calculatedCrc = calculateCRC32(
-        reinterpret_cast<const uint8_t *>(&recvBuf),
-        sizeof(recvBuf) - sizeof(receivedCrc));
+    uint32_t calculatedCrc =
+        calculateCRC32(reinterpret_cast<const uint8_t *>(&recvBuf),
+                       sizeof(recvBuf) - sizeof(uint32_t));
 
     if (receivedCrc == calculatedCrc) {
       // 校验通过，更新 armCmd
@@ -91,9 +93,9 @@ void UdpSdk::sendRecv() {
     static int size_fail_count = 0;
     ++size_fail_count;
     if (size_fail_count % 200 == 1) {
-      std::cerr << "[UdpSdk] ArmCmd 长度异常，收到 " << recvLen << " 字节，期望 "
-                << sizeof(OPENMMARM_SDK::ArmCmd) << " 字节 (count="
-                << size_fail_count << ")" << std::endl;
+      std::cerr << "[UdpSdk] ArmCmd 长度异常，收到 " << recvLen
+                << " 字节，期望 " << sizeof(OPENMMARM_SDK::ArmCmd)
+                << " 字节 (count=" << size_fail_count << ")" << std::endl;
     }
   }
 
@@ -106,14 +108,22 @@ void UdpSdk::sendRecv() {
     armState.version = PROTOCOL_VERSION;
 
     // 计算 CRC32
-    armState.crc = 0;
-    armState.crc = calculateCRC32(
-        reinterpret_cast<const uint8_t *>(&armState),
-        sizeof(armState) - sizeof(armState.crc));
+    armState.crc = calculateCRC32(reinterpret_cast<const uint8_t *>(&armState),
+                                  sizeof(armState) - sizeof(uint32_t));
 
     sendto(socket_fd_, &armState, sizeof(armState), 0,
            reinterpret_cast<struct sockaddr *>(&client_addr_),
            client_addr_len_);
+  }
+
+  // 诊断日志：每 500 帧打印一次
+  ++diag_frame_count;
+  if (diag_frame_count % 500 == 0) {
+    std::cout << "[UdpSdk][" << diag_frame_count << "] "
+              << "has_client=" << has_client_.load()
+              << " armCmd.mode=" << (int)armCmd.mode
+              << " armCmd.q_d[0]=" << armCmd.q_d[0]
+              << " armState.q[0]=" << armState.q[0] << std::endl;
   }
 }
 

@@ -2,6 +2,10 @@
 
 OpenMMArm 控制核心，负责状态机调度、底层 IO 收发和 SDK 指令接入。
 
+## 力矩控制原理
+
+- [TORQUE_CONTROL_MATH.md](TORQUE_CONTROL_MATH.md)：当前代码实现下的力矩控制数学说明（真机/仿真两条链路）
+
 ## 架构简述
 
 `openmmarm_controller` 在系统中位于“控制层”：

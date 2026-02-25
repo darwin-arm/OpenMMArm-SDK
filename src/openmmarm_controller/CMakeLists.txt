@@ -16,6 +16,7 @@ find_package(rclcpp REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(openmmarm_sdk REQUIRED)
+find_package(yaml-cpp REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GLFW QUIET glfw3)
 
@@ -90,9 +91,10 @@ ament_target_dependencies(openmmarm_ctrl
   openmmarm_sdk
 )
 
-# 链接 MuJoCo 库
+# 链接 MuJoCo 库和 yaml-cpp
 target_link_libraries(openmmarm_ctrl
   ${MUJOCO_LIBRARY}
+  yaml-cpp
 )
 
 # 安装

@@ -12,6 +12,7 @@
 #include <memory>
 #include <rclcpp/rclcpp.hpp>
 #include <thread>
+#include <yaml-cpp/yaml.h>
 
 #include "cmd/UdpSdk.h"
 #include "ctrl/CtrlComponents.h"
@@ -34,17 +35,6 @@ void signalHandler(int signum) {
 class OpenMMArmControllerNode : public rclcpp::Node {
 public:
   OpenMMArmControllerNode() : Node("openmmarm_controller") {
-    // 声明参数
-    this->declare_parameter<std::string>("communication", "SIM");
-    this->declare_parameter<std::string>("udp.mcu_ip", "192.168.123.110");
-    this->declare_parameter<int>("udp.mcu_port", 8881);
-    this->declare_parameter<int>("udp.local_port", 8871);
-    this->declare_parameter<int>("udp.sdk_port", 8871);
-    this->declare_parameter<std::string>("sim.model_path", "");
-    this->declare_parameter<bool>("sim.viewer", true);
-    this->declare_parameter<bool>("collision.open", true);
-    this->declare_parameter<double>("collision.limit_torque", 10.0);
-
     // 初始化控制组件
     ctrlComp_ = std::make_shared<CtrlComponents>();
 
@@ -57,12 +47,57 @@ public:
       ctrlComp_->projectPath = ".";
     }
 
-    // 读取参数
-    ctrlComp_->collisionOpen = this->get_parameter("collision.open").as_bool();
-    ctrlComp_->collisionLimitT =
-        this->get_parameter("collision.limit_torque").as_double();
+    // 从 yaml 配置文件读取参数
+    try {
+      std::string config_path =
+          ctrlComp_->projectPath + "/config/openmmarm_controller.yaml";
+      YAML::Node config = YAML::LoadFile(config_path);
 
-    RCLCPP_INFO(this->get_logger(), "OpenMMARM Controller 节点参数已声明");
+      if (config["communication"]) {
+        ctrlComp_->communicationMode =
+            config["communication"].as<std::string>();
+      }
+      RCLCPP_INFO(this->get_logger(), "通信模式: %s",
+                  ctrlComp_->communicationMode.c_str());
+
+      if (config["control"] && config["control"]["mode"]) {
+        ctrlComp_->controlMode = config["control"]["mode"].as<std::string>();
+      }
+      RCLCPP_INFO(this->get_logger(), "控制模式: %s",
+                  ctrlComp_->controlMode.c_str());
+      if (config["udp"]) {
+        if (config["udp"]["mcu_ip"])
+          ctrlComp_->udp.mcu_ip = config["udp"]["mcu_ip"].as<std::string>();
+        if (config["udp"]["mcu_port"])
+          ctrlComp_->udp.mcu_port = config["udp"]["mcu_port"].as<int>();
+        if (config["udp"]["local_port"])
+          ctrlComp_->udp.local_port = config["udp"]["local_port"].as<int>();
+        if (config["udp"]["sdk_port"])
+          ctrlComp_->udp.sdk_port = config["udp"]["sdk_port"].as<int>();
+      }
+
+      if (config["sim"]) {
+        if (config["sim"]["model_path"])
+          ctrlComp_->sim.model_path =
+              config["sim"]["model_path"].as<std::string>();
+        if (config["sim"]["viewer"])
+          ctrlComp_->sim.viewer = config["sim"]["viewer"].as<bool>();
+      }
+
+      if (config["collision"]) {
+        if (config["collision"]["open"])
+          ctrlComp_->collisionOpen = config["collision"]["open"].as<bool>();
+        if (config["collision"]["limit_torque"])
+          ctrlComp_->collisionLimitT =
+              config["collision"]["limit_torque"].as<double>();
+      }
+
+    } catch (const std::exception &e) {
+      RCLCPP_WARN(this->get_logger(), "配置文件解析失败: %s，使用默认参数",
+                  e.what());
+    }
+
+    RCLCPP_INFO(this->get_logger(), "OpenMMARM Controller 配置已从 YAML 加载");
   }
 
   bool initialize() {
@@ -71,28 +106,26 @@ public:
     RCLCPP_INFO(this->get_logger(), "正在初始化 IO 和 SDK 接口...");
 
     // 读取通信模式参数
-    std::string communication =
-        this->get_parameter("communication").as_string();
+    std::string communication = ctrlComp_->communicationMode;
 
     // 初始化上层 SDK 指令接口（无论 ROS/UDP 模式都创建，与 z1 一致）
-    int sdk_port = this->get_parameter("udp.sdk_port").as_int();
+    int sdk_port = ctrlComp_->udp.sdk_port;
     ctrlComp_->cmdSdk = std::make_shared<UdpSdk>(sdk_port, ctrlComp_->lowState);
     RCLCPP_INFO(this->get_logger(), "SDK 指令接口端口: %d", sdk_port);
 
     // 初始化 IO 接口（下行通信）
     // shared_from_this() 在此处安全调用，因为 shared_ptr 已构造完成
     if (communication == "UDP") {
-      std::string mcu_ip = this->get_parameter("udp.mcu_ip").as_string();
-      int mcu_port = this->get_parameter("udp.mcu_port").as_int();
-      int local_port = this->get_parameter("udp.local_port").as_int();
+      std::string mcu_ip = ctrlComp_->udp.mcu_ip;
+      int mcu_port = ctrlComp_->udp.mcu_port;
+      int local_port = ctrlComp_->udp.local_port;
       ctrlComp_->ioInter =
           std::make_shared<IOUDP>(mcu_ip, mcu_port, local_port);
       RCLCPP_INFO(this->get_logger(), "使用 UDP 通信模式 [%s:%d]",
                   mcu_ip.c_str(), mcu_port);
     } else if (communication == "SIM") {
-      std::string model_path =
-          this->get_parameter("sim.model_path").as_string();
-      bool sim_viewer = this->get_parameter("sim.viewer").as_bool();
+      std::string model_path = ctrlComp_->sim.model_path;
+      bool sim_viewer = ctrlComp_->sim.viewer;
       if (model_path.empty()) {
         // 默认使用 openmmarm_description 包中的 URDF
         try {
@@ -105,16 +138,16 @@ public:
           return false;
         }
       }
-      ctrlComp_->ioInter =
-          std::make_shared<IOMujoco>(model_path, ctrlComp_->dt, sim_viewer);
-      RCLCPP_INFO(this->get_logger(), "使用 MuJoCo 仿真模式，模型: %s, viewer: %s",
+      ctrlComp_->ioInter = std::make_shared<IOMujoco>(
+          model_path, ctrlComp_->dt, sim_viewer, ctrlComp_->controlMode);
+      RCLCPP_INFO(this->get_logger(),
+                  "使用 MuJoCo 仿真模式，模型: %s, viewer: %s",
                   model_path.c_str(), sim_viewer ? "on" : "off");
     } else {
       RCLCPP_WARN(this->get_logger(), "未知通信模式: %s，使用默认 SIM 模式",
                   communication.c_str());
-      std::string model_path =
-          this->get_parameter("sim.model_path").as_string();
-      bool sim_viewer = this->get_parameter("sim.viewer").as_bool();
+      std::string model_path = ctrlComp_->sim.model_path;
+      bool sim_viewer = ctrlComp_->sim.viewer;
       if (model_path.empty()) {
         try {
           std::string desc_path = ament_index_cpp::get_package_share_directory(
